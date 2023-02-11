@@ -14,10 +14,8 @@ import os
 import pyodbc
 
 # GET API KEYS
-content = open('aws_credmt.json')
-config = json.load(content)
-access_key = config['access_key']
-secret_access_key = config['secret_access_key']
+access_key = os.environ.get('access_key')
+secret_access_key = os.environ.get('secret_access_key')
 
 now = datetime.now()
 day = now.strftime("%d%m%Y")
