@@ -1,182 +1,145 @@
-# FINAL CODE WITH BATCH PROCESSING
-
-
 from datetime import date
 from datetime import datetime
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.engine import URL
 import pandas as pd
-import json
 import io
 import boto3
 import os
 import pyodbc
+import snowflake.connector
+import yaml
 
 # GET API KEYS
 access_key = os.environ.get('access_key')
 secret_access_key = os.environ.get('secret_access_key')
 
+# FOLDER CREATION IN S3 BUCKET
+bucket_name = "etl-snfk1"
+# ts_col = "currentdate"
+server = "DESKTOP-IND"
 now = datetime.now()
 day = now.strftime("%d%m%Y")
-
-# FOLDER CREATION IN S3 BUCKET
-BUCKET_NAME = "om-test-sql"
-ts_col = "currentdate"
-incr = "etl_project/incr/"
-hist = "etl_project/hist/"
-full_load = "etl_project/full_load/batch/"
-server = "DESKTOP-I2P6GLV\SQLEXPRESS"
 
 # CONNECTING TO AWS S3
 s3_client = boto3.client('s3', aws_access_key_id=access_key, aws_secret_access_key=secret_access_key,
                          region_name='ap-south-1')
 
 
+
 # EXTRACTION
-def extract(database_name, load_type, source_table):
-    # SQL SERVER DETAILS
-    conn_str = "DRIVER={SQL Server};PORT=1433;SERVER=%s;DATABASE=%s;Trusted_Connection=yes;" % (server, database_name)
+def extract_data(database_name, table_name, batch_size):
+    start_time = datetime.now().strftime('%F %T.%f')[:-3]
+    print(start_time)
 
-    # cnxn = pyodbc.connect(conn_str)
-    connection_url = URL.create("mssql+pyodbc", query={"odbc_connect": conn_str})
+    with open('cred.yaml', 'r') as file:
+        credentials = yaml.safe_load(file)
 
-    engine = create_engine(connection_url)
-    session = scoped_session(sessionmaker(bind=engine))
-    s = session()
+    sf_conn = snowflake.connector.connect(
+        user=credentials['user'],
+        password=credentials['password'],
+        account=credentials['account'],
+        warehouse=credentials['warehouse'],
+        database=credentials['database'],
+        schema=credentials['schema'],
+        role=credentials['role']
+    )
+    cs = sf_conn.cursor()
+    bucket_name = credentials['bucket_name']
+    server = credentials['server']
 
-    # LOADING INCR DATA FOR SPECIFIC TABLE
-    if load_type == "incr_load":
 
-        # FETCHING INCR RECORDS OF ALL TABLE
-        src_tables = s.execute("""select name as table_name from sys.tables""")
-        print("src_tabls", src_tables)
-        if source_table == 'all_tables':
-            for tbl in src_tables:
-                print("tbl", tbl)
-                fetch_incr_at = "select * from {} where convert(varchar(10),currentdate,111) = (SELECT MAX(CONVERT(VARCHAR(10),currentdate,111)) FROM {})".format(
-                    tbl[0], tbl[0])
-                print(fetch_incr_at)
-                fia = pd.read_sql_query(fetch_incr_at, engine)
-                print("running till here:", fia)
+    try:
 
-                with io.StringIO() as csv_buffer:
-                    # LOADING INTO INCR FOLDER
-                    fia.to_csv(csv_buffer, index=False)
-                    response = s3_client.put_object(Bucket=BUCKET_NAME, Key=incr + tbl[0] + "/" + tbl[0] + ".csv",
-                                                    Body=csv_buffer.getvalue())
+        try:
+            fetch_status = cs.execute(
+                "select max(start_time) from job_status_table where JOB_NAME = '{}' and job_status = 'SUCCESS'"
+                .format(table_name))
+            last_l = pd.DataFrame(fetch_status)
+            row2 = last_l.iloc[0][0]
+            a = str(row2)
+            last_load = a[:23]
+            print(last_load)
+        except:
+            # Default Last value
+            last_load = '1900-01-01 00:00:00.000'
+            print(last_load)
 
-                    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-                    if status == 200:
-                        print(f"Successful S3 put_object response. Status - {status}")
+        # SQL SERVER DETAILS
+        conn_str = "DRIVER={SQL Server};PORT=1433;SERVER=%s;DATABASE=%s;Trusted_Connection=yes;" % (
+        server, database_name)
+        cnxn = pyodbc.connect(conn_str)
+        connection_url = URL.create("mssql+pyodbc", query={"odbc_connect": conn_str})
+        cursor = cnxn.cursor()
+        engine = create_engine(connection_url)
+        session = scoped_session(sessionmaker(bind=engine))
+        s = session()
+
+        # FUNCTION ESTABLISHMENT
+        # table_name = 'all_tables' OR 'Specific_table_name'
+        if table_name == 'all_tables':
+            db_tables = [table.table_name for table in cursor.tables(tableType='TABLE')]
+            # cursor.close()
+            print(db_tables)
+        else:
+            db_tables = [table_name]
+            print(table_name + " table selected.")
+
+        for tbl in db_tables:
+            if tbl == 'trace_xe_action_map':
+                continue
+            if tbl == 'trace_xe_event_map':
+                continue
+            else:
+                incr = "{}/{}/".format(table_name, day)
+                # Selecting data from SQL Server
+                fetch_load = "select * from {} where updated_on > '{}'".format(table_name, last_load)
+                df = pd.read_sql_query(text(fetch_load),con=engine.connect())
+                count=len(df)
+                print(count)
+                if count % batch_size == 0:
+                    no_of_batches = count // batch_size
+                else:
+                    no_of_batches = (count // batch_size) + 1
+                print(no_of_batches)
+                offset = 0
+                for i in range(no_of_batches):
+                    fetch_data = (
+                        "SELECT * FROM {} where updated_on > '{}' ORDER BY updated_on OFFSET {} ROWS FETCH NEXT {} rows ONLY").format(
+                        table_name,last_load,offset, batch_size)
+                    df = pd.read_sql_query(text(fetch_data), con=engine.connect())
+                    print(df)
+
+                    offset=offset+batch_size
+                    print(offset)
+                    if df.empty:
+                        print('No Latest Records')
+                        continue
                     else:
-                        print(f"Unsuccessful S3 put_object response. Status - {status}")
-                    print("Data Imported Successful")
-
-                    # LOADING INTO HISTORICAL FOLDER
-                    fia.to_csv(csv_buffer, index=False, mode='a')
-                    response = s3_client.put_object(Bucket=BUCKET_NAME,
-                                                    Key=hist + tbl[0] + "/" + day + "/" + tbl[0] + ".csv",
-                                                    Body=csv_buffer.getvalue())
-                    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-                    if status == 200:
-                        print(f"Successful S3 put_object response. Status - {status}")
-
-        else:
-            for tbl in src_tables:
-                if tbl[0] == source_table:
-                    # FETCHING INCR RECORDS OF SPECIFIC TABLE
-                    fetch_latest_record = "select * from {} where convert(varchar(10),currentdate,111) = (SELECT MAX(CONVERT(VARCHAR(10),currentdate,111)) FROM {})".format(
-                        tbl[0], tbl[0])
-                    print(fetch_latest_record)
-                    flr = pd.read_sql_query(fetch_latest_record, con=engine)
-                    print(flr, source_table)
-
-                    with io.StringIO() as csv_buffer:
-                        # LOADING INTO INCR FOLDER
-                        flr.to_csv(csv_buffer, index=False)
-                        response = s3_client.put_object(Bucket=BUCKET_NAME,
-                                                        Key=incr + source_table + "/" + source_table + ".csv",
-                                                        Body=csv_buffer.getvalue())
-                        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-                        if status == 200:
-                            print(f"Successful S3 put_object response. Status - {status}")
-                        else:
-                            print(f"Unsuccessful S3 put_object response. Status - {status}")
-                        print("Data Imported Successful")
-
-                        # LOADING INTO HISTORICAL FOLDER
-                        flr.to_csv(csv_buffer, index=False, mode='append')
-                        response = s3_client.put_object(Bucket=BUCKET_NAME,
-                                                        Key=hist + source_table + "/" + day + "/" + source_table + ".csv",
-                                                        Body=csv_buffer.getvalue())
-                        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-                        if status == 200:
-                            print(f"Successful S3 put_object response. Status - {status}")
-
-    elif load_type == "full_load":
-
-        # FETCHING FULL LOAD FOR ALL TABLES
-        src_tables = s.execute("""select name as table_name from sys.tables""")
-        print(src_tables)
-        if source_table == 'all_tables':
-            batch_size = 100
-            for tbl in src_tables:
-                fetch_full_load = "select * from {}".format(tbl[0])
-                print(fetch_full_load)
-                df = pd.read_sql_query(fetch_full_load, engine)
-                for i in range(0, len(df), batch_size):
-                    batch = df[i:i + batch_size]
-
-
-
-                    with io.StringIO() as csv_buffer:
-                        # LOADING INTO ALL TABLES
-                        batch.to_csv(csv_buffer, index=False)
-                        response = s3_client.put_object(Bucket=BUCKET_NAME,
-                                                        Key=full_load + tbl[0] + "/" + tbl[0] + str(datetime.now()) + ".csv",
-                                                        Body=csv_buffer.getvalue())
-
-                        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-                        if status == 200:
-                            print(f"Successful S3 put_object response. Status - {status}")
-                        else:
-                            print(f"Unsuccessful S3 put_object response. Status - {status}")
-                        print("Data Imported Successful")
-
-        # SELECTING SPECIFIC TABLES FOR FULL LOAD
-        else:
-            batch_size = 100
-            for tbl in src_tables:
-                if tbl[0] == source_table:
-                    fetch_spec_load = "select * from {}".format(tbl[0])
-                    print(fetch_spec_load)
-                    df = pd.read_sql_query(fetch_spec_load, engine)
-                    for i in range(0, len(df), batch_size):
-                        batch = df[i:i + batch_size]
-                        print(df)
-
                         with io.StringIO() as csv_buffer:
-                            # LOADING FOR SPECFIC TABLES
-                            batch.to_csv(csv_buffer, index=False)
-                            response = s3_client.put_object(Bucket=BUCKET_NAME,
-                                                            Key=full_load + source_table + "/" + source_table + str(datetime.now()) +".csv",
+                            # LOADING INTO INCR FOLDER
+                            df.to_csv(csv_buffer, index=False)
+                            response = s3_client.put_object(Bucket=bucket_name,
+                                                            Key=incr + str(
+                                                                datetime.now()) + ".csv",
                                                             Body=csv_buffer.getvalue())
+                            print('Data loaded successfully')
 
-                            status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-                            if status == 200:
-                                print(f"Successful S3 put_object response. Status - {status}")
-                            else:
-                                print(f"Unsuccessful S3 put_object response. Status - {status}")
-                            print("Data Imported Successful")
-
-
-extract('ABDB', 'incr_load', 'customers')
-# def extract(database_name,load_type,source_table='all_tables'):
+                end_time = datetime.now().strftime('%F %T.%f')[:-3]
+                cs.execute(
+                    "insert into JOB_STATUS_TABLE(JOB_NAME,START_TIME,END_TIME,JOB_STATUS) values('{}','{}', '{}', 'SUCCESS')".format(
+                        table_name, start_time, end_time))
 
 
-# full_load - all_tables + full_Load - working
-#             spec_table + full_load - working
+    except:
 
-# incr_load - all_tables + incr  - working
-#             spec_table + incr  - working
+        cs.execute(
+            "insert into JOB_STATUS_TABLE(JOB_NAME,START_TIME,JOB_STATUS) values('{}','{}', 'FAILED')".format(
+                table_name, start_time))
+
+        print('Job failed')
+
+
+
+extract_data('Exceliq', 'customers', 50)
