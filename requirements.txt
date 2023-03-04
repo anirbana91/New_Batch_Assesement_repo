@@ -6,4 +6,3 @@ io
 boto3
 pyodbc
 yaml
-snowflake
