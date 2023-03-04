@@ -1,0 +1,12 @@
+user: virajch4321
+password: Pass@1234Myself
+account: ru94613.ap-southeast-1
+warehouse: JJ
+database: SS
+schema: RAW
+role: ACCOUNTADMIN
+bucket_name: viraj-ch
+server: LAPTOP-AQC9RUGN
+tables: ['customers','orders','salesman']
+secret_access_key: idlTY+1zwCspZkEI/t3m9aGEyTkmXoQFtDwUEypr
+access_key: AKIARVG456BH6NYNRLCF
